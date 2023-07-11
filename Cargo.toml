@@ -1,0 +1,16 @@
+[package]
+name = "skicka"
+version = "0.1.0"
+authors = ["Patryk Wychowaniec <pwychowaniec@pm.me>"]
+edition = "2021"
+
+[dependencies]
+async-stream = "0.3.5"
+clap = { version = "4.3.11", features = ["derive"] }
+futures = "0.3.28"
+humantime = "2.1.0"
+hyper = { version = "0.14.27", features = ["full"] }
+names = { version = "0.14.0", default-features = false }
+tokio = { version = "1.29.1", features = ["full"] }
+ubyte = "0.10"
+url = "2.4.0"
