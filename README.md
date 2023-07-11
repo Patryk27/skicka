@@ -33,7 +33,7 @@ it will download the file as a regular attachment.
 You can also transfer arbitrary data (including binary):
 
 ```
-echo "Hello, World!" | curl --data-binary @- skicka.pwy.io:99
+echo 'Hello, World!' | curl --data-binary @- skicka.pwy.io:99
 ```
 
 ## How it works
