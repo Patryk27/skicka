@@ -73,6 +73,27 @@ Note that those limits pertain only the public instance at `skicka.pwy.io:99` -
 you can change the limits (passed through command-line arguments) if you want to
 launch a self-hosted instance.
 
+## Self-hosting
+
+All options have reasonable defaults, so just running the executable should do
+it:
+
+```
+cargo run --release
+```
+
+You might want to adjust the listening port:
+
+```
+cargo run --release -- --listen 0.0.0.0:1234
+```
+
+... or maybe specify the motto (present when someone does `GET /`):
+
+```
+cargo run --release -- --motto "good say, sir! :3\r\n"
+```
+
 ## License
 
 MIT License

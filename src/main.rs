@@ -15,13 +15,17 @@ use ubyte::ByteUnit;
 
 #[derive(Debug, Parser)]
 struct Args {
+    /// Where to listen for requests
     #[clap(long)]
     #[clap(default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 
+    /// When present, prefixes the links shown to users; otherwise users see
+    /// only the randomized upload codes, without any `http://...` prefix
     #[clap(long)]
     remote: Option<String>,
 
+    /// When present, is printed when someone does `GET /`
     #[clap(long)]
     motto: Option<String>,
 
