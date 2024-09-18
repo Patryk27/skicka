@@ -3,19 +3,22 @@
 Skicka (from Swedish _send_) allows to send files between machines - no
 installation required!
 
-Transmitting a file is as easy as piping its data through `curl`:
+Just pipe your stuff through `curl`:
 
 ```
-cat your-file.txt | curl --data-binary @- skicka.pwy.io:99
+cat your-file.txt | curl -sT - skicka.pwy.io:99
+
+# or even:
+
+echo 'Hello, World!' | curl -sT - skicka.pwy.io:99
 ```
 
-... noting down the link returned by that command and running `curl` / `wget` on
-the target machine:
+... note down the link and run `curl` or `wget` on the target machine:
 
 ```
 curl http://skicka.pwy.io:99/foo-bar > your-file.txt
 
-# or
+# or:
 
 wget http://skicka.pwy.io:99/foo-bar
 ```
@@ -24,17 +27,11 @@ Alternatively, if your target machine doesn't have those tools, but it does have
 a web browser, you can pass a file name when uploading it:
 
 ```
-cat your-file.txt | curl --data-binary @- 'skicka.pwy.io:99?name=your-file.txt'
+cat your-file.txt | curl -sT - 'skicka.pwy.io:99?name=your-file.txt'
 ```
 
 ... and then simply open the link returned by that command in your web browser -
 it will download the file as a regular attachment.
-
-You can also transfer arbitrary data (including binary):
-
-```
-echo 'Hello, World!' | curl --data-binary @- skicka.pwy.io:99
-```
 
 ## How it works
 
@@ -62,13 +59,11 @@ zero-installation Skicka.
 
 - 8 GB maximum file size,
 
-- 120 seconds between running `cat | curl` and starting to download the file
+- 5 minutes between running `cat | curl` and starting to download the file
   (note that the download itself _can_ take longer, it's just that you must 
-  start the downloading in 2 minutes, otherwise the connection will get closed),
-  
-- My server (in Hetzner) has a monthly 20 TB upload limit, so take that into
-  consideration as well.
-  
+  start the downloading within 5 minutes, otherwise the connection will get
+  closed).
+
 Note that those limits pertain only the public instance at `skicka.pwy.io:99` -
 you can change the limits (passed through command-line arguments) if you want to
 launch a self-hosted instance.
@@ -85,7 +80,7 @@ cargo run --release
 You might want to adjust the listening port:
 
 ```
-cargo run --release -- --listen 0.0.0.0:1234
+cargo run --release -- --listen 0.0.0.0:80
 ```
 
 ... or maybe specify the motto (present when someone does `GET /`):
