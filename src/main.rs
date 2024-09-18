@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
     });
 
     let app = Router::new()
-        .route("/", get(handle_index).post(handle_send))
+        .route("/", get(handle_index).put(handle_send).post(handle_send))
         .route("/:id", get(handle_recv))
         .with_state(state);
 
