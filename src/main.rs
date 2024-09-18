@@ -1,75 +1,82 @@
-use async_stream::stream;
+use anyhow::Result;
+use axum::body::{Body, BodyDataStream};
+use axum::extract::{Path, Query, State as AxumState};
+use axum::http::{header, StatusCode};
+use axum::response::Response;
+use axum::routing::get;
+use axum::{Error, Router};
 use clap::Parser;
-use futures::{FutureExt, Stream, StreamExt};
-use hyper::body::Bytes;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{header, Body, Error, Method, Request, Response, Server, StatusCode};
+use futures::{stream, FutureExt, StreamExt};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex};
-use tokio::{pin, select, time};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::{task, time};
+use tokio_stream::wrappers::ReceiverStream;
 use ubyte::ByteUnit;
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// Where to listen for requests
     #[clap(long)]
     #[clap(default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 
-    /// When present, prefixes the links shown to users; otherwise users see
-    /// only the randomized upload codes, without any `http://...` prefix
+    /// Remote URL at which this service is installed; optional.
+    ///
+    /// It's used to prefix links shown to users, so that they know the entire
+    /// download link at once instead of being shown just the randomized code.
     #[clap(long)]
     remote: Option<String>,
 
-    /// When present, is printed when someone does `GET /`
+    /// Motto, printed during `GET /`; optional.
     #[clap(long)]
     motto: Option<String>,
 
+    /// Maximum time between someone calling `POST /` and the corresponding
+    /// `GET /:id`.
+    ///
+    /// This timeout doesn't include the transmission time, it's just about the
+    /// time between creating the upload and *starting* the download.
     #[clap(long)]
-    #[clap(default_value = "120s")]
-    #[arg(value_parser = parse_duration)]
-    initial_timeout: Duration,
+    #[clap(default_value = "5m")]
+    #[arg(value_parser = Self::parse_duration)]
+    intent_timeout: Duration,
 
+    /// Maximum time between retrieving and sending consecutive chunks.
     #[clap(long)]
-    #[clap(default_value = "60s")]
-    #[arg(value_parser = parse_duration)]
+    #[clap(default_value = "2m")]
+    #[arg(value_parser = Self::parse_duration)]
     chunk_timeout: Duration,
 
     #[clap(long)]
     #[clap(default_value = "8GB")]
-    #[arg(value_parser = parse_storage)]
+    #[arg(value_parser = Self::parse_storage)]
     max_transfer_size: u64,
 
     #[clap(long)]
-    #[clap(default_value = "1KB")]
-    #[arg(value_parser = parse_storage)]
-    max_uri_length: u64,
+    #[clap(default_value = "1024")]
+    max_connections: usize,
+}
 
-    #[clap(long)]
-    #[clap(default_value = "512")]
-    max_active_connections: usize,
+impl Args {
+    fn parse_duration(arg: &str) -> Result<Duration, humantime::DurationError> {
+        arg.parse::<humantime::Duration>().map(Into::into)
+    }
+
+    fn parse_storage(arg: &str) -> Result<u64, String> {
+        arg.parse::<ByteUnit>()
+            .map(|u| u.as_u64())
+            .map_err(|err| err.to_string())
+    }
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args = Args::parse();
-    let listen = args.listen.clone();
-
-    let state = Arc::new(State {
-        args,
-        connections: Default::default(),
-        next_connection_idx: Default::default(),
-    });
-
-    let service = make_service_fn(move |_| {
-        let state = state.clone();
-
-        async move { Ok::<_, Error>(service_fn(move |request| handle(state.clone(), request))) }
-    });
 
     println!(r#"   _____ _    _      _         "#);
     println!(r#"  / ____| |  (_)    | |        "#);
@@ -78,85 +85,57 @@ async fn main() {
     println!(r#"  ____) |   <| | (__|   < (_| |"#);
     println!(r#" |_____/|_|\_\_|\___|_|\_\__,_|"#);
     println!();
-    println!("Started; listening at: {}", listen);
+    println!("listening at {}", &args.listen);
     println!();
 
-    Server::bind(&listen).serve(service).await.unwrap();
-}
+    let listener = TcpListener::bind(&args.listen).await?;
 
-struct State {
-    args: Args,
-    connections: Mutex<HashMap<String, Connection>>,
-    next_connection_idx: AtomicUsize,
-}
+    let state = Arc::new(State {
+        args,
+        conns: Default::default(),
+        next_conn_idx: Default::default(),
+    });
 
-struct Connection {
-    idx: usize,
-    file_name: Option<String>,
-    file_body: Box<dyn Stream<Item = Result<Bytes, Error>> + Send + Unpin>,
-    on_completed: oneshot::Sender<()>,
-}
+    let app = Router::new()
+        .route("/", get(handle_index).post(handle_send))
+        .route("/:id", get(handle_recv))
+        .with_state(state);
 
-async fn handle(state: Arc<State>, request: Request<Body>) -> Result<Response<Body>, Error> {
-    if let Err(response) = validate_request(&state, &request) {
-        return Ok(response);
-    }
-
-    println!("Handling: {} {}", request.method(), request.uri().path());
-
-    match (request.method(), request.uri().path()) {
-        (&Method::GET, "/") => {
-            return handle_index(state);
-        }
-
-        (&Method::POST, "/") => {
-            return handle_send(state, request).await;
-        }
-
-        (&Method::GET, id) => {
-            if let Some(id) = id.strip_prefix('/') {
-                return handle_recv(state, id.to_string()).await;
-            }
-        }
-
-        _ => {}
-    }
-
-    Ok(err_not_found(None))
-}
-
-fn validate_request(state: &State, request: &Request<Body>) -> Result<(), Response<Body>> {
-    if request.uri().path().len() as u64 >= state.args.max_uri_length {
-        return Err(err_payload_too_large());
-    }
-
-    if request.uri().query().map_or(0, |query| query.len()) as u64 >= state.args.max_uri_length {
-        return Err(err_payload_too_large());
-    }
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-fn handle_index(state: Arc<State>) -> Result<Response<Body>, Error> {
-    let body = state.args.motto.clone().map(Body::from).unwrap_or_default();
-
-    Ok(Response::new(body))
+struct State {
+    args: Args,
+    conns: Mutex<HashMap<String, Conn>>,
+    next_conn_idx: AtomicUsize,
 }
 
-async fn handle_send(state: Arc<State>, request: Request<Body>) -> Result<Response<Body>, Error> {
-    let file_name = request.uri().query().and_then(|query| {
-        url::form_urlencoded::parse(query.as_bytes())
-            .find(|(key, _)| key == "name")
-            .map(|(_, value)| value.to_string())
-    });
+struct Conn {
+    idx: usize,
+    name: Option<String>,
+    body: BodyDataStream,
+    on_completed: oneshot::Sender<()>,
+}
 
-    let file_body = Box::new(request.into_body());
+async fn handle_index(state: AxumState<Arc<State>>) -> String {
+    state.args.motto.clone().unwrap_or_default()
+}
 
-    // ---
+#[derive(Debug, Deserialize)]
+struct SendQuery {
+    name: Option<String>,
+}
 
-    let mut connections = state.connections.lock().await;
+async fn handle_send(
+    state: AxumState<Arc<State>>,
+    query: Query<SendQuery>,
+    body: Body,
+) -> Result<Response, Response> {
+    let mut conns = state.conns.lock().await;
 
-    if connections.len() >= state.args.max_active_connections {
+    if conns.len() >= state.args.max_connections {
         println!("[-] connection rejected (too many active connections)");
 
         return Ok(err_server_overloaded());
@@ -176,137 +155,147 @@ async fn handle_send(state: Arc<State>, request: Request<Body>) -> Result<Respon
 
             let id = names::Generator::default().next().unwrap();
 
-            if !connections.contains_key(&id) {
+            if !conns.contains_key(&id) {
                 break id;
             }
         }
     };
 
-    let idx = state.next_connection_idx.fetch_add(1, Ordering::Relaxed);
+    let idx = state.next_conn_idx.fetch_add(1, Ordering::Relaxed);
     let (on_completed_tx, on_completed_rx) = oneshot::channel();
 
-    let connection = Connection {
-        idx,
-        file_name,
-        file_body,
-        on_completed: on_completed_tx,
-    };
-
-    println!(
-        "[{}/{}] connection created; active connections: {}",
-        id,
-        idx,
-        1 + connections.len()
+    conns.insert(
+        id.clone(),
+        Conn {
+            idx,
+            name: query.0.name,
+            body: body.into_data_stream(),
+            on_completed: on_completed_tx,
+        },
     );
 
-    connections.insert(id.clone(), connection);
+    println!(
+        "[{idx}:{id}] connection created; active connections: {}",
+        conns.len(),
+    );
 
-    drop(connections);
+    let response = Body::from_stream({
+        let response = if let Some(remote) = &state.args.remote {
+            format!("{}/{}", remote, id)
+        } else {
+            id.clone()
+        };
 
-    // ---
+        stream::once(async move { Ok::<_, Error>(format!("{}\r\n", response)) })
+            .chain(on_completed_rx.into_stream().map(|_| Ok(String::default())))
+    });
 
-    let response = if let Some(remote) = &state.args.remote {
-        format!("{}/{}", remote, id)
-    } else {
-        id.clone()
-    };
+    task::spawn({
+        let state = state.clone();
 
-    let response = futures::stream::iter(Some(Ok::<_, Error>(format!("{}\r\n", response))))
-        .chain(on_completed_rx.into_stream().map(|_| Ok(String::default())));
+        async move {
+            time::sleep(state.args.intent_timeout).await;
 
-    // ---
+            let mut conns = state.conns.lock().await;
 
-    tokio::spawn(async move {
-        time::sleep(state.args.initial_timeout).await;
+            if let Some(conn) = conns.get(&id) {
+                if conn.idx == idx {
+                    conns.remove(&id);
 
-        let mut connections = state.connections.lock().await;
-
-        let is_stale = connections
-            .get(&id)
-            .map_or(false, |connection| connection.idx == idx);
-
-        if is_stale {
-            connections.remove(&id);
-
-            println!(
-                "[{}/{}] connection reaped; active connections: {}",
-                id,
-                idx,
-                connections.len()
-            );
+                    println!(
+                        "[{idx}:{id}] connection reaped; active connections: {}",
+                        conns.len()
+                    );
+                }
+            }
         }
     });
 
-    Ok(Response::new(Body::wrap_stream(response)))
+    Ok(Response::new(response))
 }
 
-async fn handle_recv(state: Arc<State>, id: String) -> Result<Response<Body>, Error> {
-    let Some(connnection) = state.connections.lock().await.remove(&id) else {
+async fn handle_recv(
+    state: AxumState<Arc<State>>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let Some(conn) = state.conns.lock().await.remove(&id) else {
         return Ok(err_not_found("no such connection found\r\n"));
     };
 
-    let Connection {
+    let Conn {
         idx,
-        file_name,
-        mut file_body,
+        name,
+        mut body,
         on_completed,
-    } = connnection;
+    } = conn;
 
-    println!("[{}/{}] connection fused", id, idx);
+    println!("[{idx}:{id}] connection fused");
 
-    let stream = stream! {
-        let mut transferred_bytes = 0;
+    let (stream_tx, stream_rx) = mpsc::channel(1);
+
+    task::spawn(async move {
+        let mut size = 0;
 
         let reason = loop {
-            let timeout = time::sleep(state.args.chunk_timeout);
+            let chunk = time::timeout(state.args.chunk_timeout, body.next()).await;
 
-            pin!(timeout);
+            match chunk {
+                Ok(Some(chunk)) => {
+                    if let Ok(chunk) = &chunk {
+                        size += chunk.len() as u64;
 
-            select! {
-                chunk = file_body.next() => {
-                    if let Some(chunk) = chunk {
-                        if let Ok(chunk) = &chunk {
-                            transferred_bytes += chunk.len() as u64;
+                        if size >= state.args.max_transfer_size {
+                            break "reached transfer size limit";
+                        }
+                    }
 
-                            if transferred_bytes >= state.args.max_transfer_size {
-                                break "reached transfer size limit";
-                            }
+                    match time::timeout(state.args.chunk_timeout, stream_tx.send(chunk)).await {
+                        Ok(Ok(_)) => {
+                            continue;
                         }
 
-                        yield chunk;
-                    } else {
-                        break "transfer completed";
+                        Ok(Err(_)) => {
+                            break "transfer abandoned";
+                        }
+
+                        Err(_) => {
+                            break "timed-out sending the current chunk";
+                        }
                     }
                 }
 
-                _ = &mut timeout => {
-                    break "reached chunk time limit";
+                Ok(None) => {
+                    break "transfer completed";
+                }
+
+                Err(_) => {
+                    break "timed-out retrieving the next chunk";
                 }
             }
         };
 
-        println!(
-            "[{}/{}] connection closed ({}); active connections: {}",
-            id,
-            idx,
-            reason,
-            state.connections.lock().await.len(),
-        );
-
         _ = on_completed.send(());
 
-    };
+        println!(
+            "[{idx}:{id}] connection closed after {}: {reason}; \
+             active connections: {}",
+            ByteUnit::Byte(size),
+            state.conns.lock().await.len(),
+        );
+    });
 
     let mut response = Response::builder();
 
-    if let Some(file_name) = file_name {
+    if let Some(file_name) = name {
         response = response.header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", file_name),
         );
     }
 
-    let response = response.body(Body::wrap_stream(stream)).unwrap();
+    let response = response
+        .body(Body::from_stream(ReceiverStream::new(stream_rx)))
+        .unwrap();
 
     Ok(response)
 }
@@ -320,26 +309,9 @@ fn err_not_found(body: impl Into<Option<&'static str>>) -> Response<Body> {
         .unwrap()
 }
 
-fn err_payload_too_large() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::PAYLOAD_TOO_LARGE)
-        .body(Body::default())
-        .unwrap()
-}
-
 fn err_server_overloaded() -> Response<Body> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body(Body::from("server overloaded, please try again later"))
         .unwrap()
-}
-
-fn parse_duration(arg: &str) -> Result<Duration, humantime::DurationError> {
-    arg.parse::<humantime::Duration>().map(Into::into)
-}
-
-fn parse_storage(arg: &str) -> Result<u64, String> {
-    arg.parse::<ByteUnit>()
-        .map(|u| u.as_u64())
-        .map_err(|err| err.to_string())
 }

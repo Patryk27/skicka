@@ -1,16 +1,17 @@
 [package]
 name = "skicka"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Patryk Wychowaniec <pwychowaniec@pm.me>"]
 edition = "2021"
 
 [dependencies]
-async-stream = "0.3.5"
-clap = { version = "4.3.11", features = ["derive"] }
-futures = "0.3.28"
+anyhow = "1.0.89"
+axum = "0.7.5"
+clap = { version = "4.5.17", features = ["derive"] }
+futures = "0.3.30"
 humantime = "2.1.0"
-hyper = { version = "0.14.27", features = ["full"] }
 names = { version = "0.14.0", default-features = false }
-tokio = { version = "1.29.1", features = ["full"] }
-ubyte = "0.10"
-url = "2.4.0"
+serde = { version = "1.0.210", features = ["derive"] }
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-stream = "0.1.16"
+ubyte = "0.10.4"
