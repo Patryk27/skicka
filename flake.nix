@@ -48,14 +48,16 @@
 
         in
         {
-          defaultPackage = naersk'.buildPackage {
-            src = ./.;
+          packages = {
+            default = naersk'.buildPackage {
+              src = ./.;
+            };
           };
         }
       );
 
-      module = {
-        nixosModule = { config, lib, pkgs, ... }:
+      nixosModules = {
+        default = { config, lib, pkgs, ... }:
           with lib;
           let cfg = config.services.skicka;
           in
@@ -66,7 +68,7 @@
 
                 package = mkOption {
                   type = types.package;
-                  default = self.defaultPackage.${pkgs.system};
+                  default = self.packages.${pkgs.system}.default;
                 };
 
                 listen = mkOption {
@@ -92,7 +94,8 @@
                   let
                     mottoFile = pkgs.writeText "motto.txt" (
                       (builtins.replaceStrings [ "\n" ] [ "\r\n" ] cfg.motto)
-                        + "\r\n"
+                      + "\r\n"
+                      + "\r\n"
                     );
 
                   in
@@ -110,6 +113,59 @@
           };
       };
 
+      nixosConfigurations = {
+        container =
+          nixpkgs.lib.nixosSystem {
+            system = "x86_64-linux";
+
+            modules = [
+              self.nixosModules.default
+
+              ({ pkgs, ... }: {
+                boot = {
+                  isContainer = true;
+                };
+
+                environment = {
+                  systemPackages = with pkgs; [
+                    htop
+                  ];
+                };
+
+                networking = {
+                  firewall = {
+                    enable = false;
+                  };
+                };
+
+                services = {
+                  caddy = {
+                    enable = true;
+
+                    extraConfig = ''
+                      http://10.233.1.2:80 {
+                        reverse_proxy http://127.0.0.1:8080
+                      }
+                    '';
+                  };
+
+                  skicka = {
+                    enable = true;
+                    listen = "0.0.0.0:8080";
+                    motto = "Hello, World!";
+                  };
+                };
+
+                system = {
+                  stateVersion = "24.05";
+                };
+              })
+            ];
+          };
+      };
+
     in
-    packages // module;
+    packages
+    // { inherit nixosModules; }
+    // { inherit nixosConfigurations; };
 }
